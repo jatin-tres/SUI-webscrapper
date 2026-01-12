@@ -8,18 +8,18 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# --- Page Config ---
-st.set_page_config(page_title="SUI Scraper", layout="wide")
-st.title("🔹 SUI Wallet Scraper (Final V2)")
+# --- Page Setup ---
+st.set_page_config(page_title="SUI Scraper V3", layout="wide")
+st.title("🔹 SUI Wallet Scraper (Final Fixed Version)")
 
 # --- Sidebar ---
 with st.sidebar:
     st.header("Settings")
     wallet_address = st.text_input("Wallet Address", value="0xa36a0602be0fcbc59f7864c76238e5e502a1e13150090aab3c2063d34dde1d8a")
-    max_pages = st.number_input("Max Pages", 1, 20, 3)
+    max_pages = st.number_input("Max Pages", 1, 50, 3)
     start_btn = st.button("🚀 Start Scraping", type="primary")
 
-# --- Cloud-Compatible Driver ---
+# --- Optimized Driver ---
 def get_driver():
     options = Options()
     options.add_argument('--headless=new')
@@ -39,34 +39,26 @@ if start_btn:
         driver = get_driver()
         url = f"https://suiscan.xyz/mainnet/account/{wallet_address}"
         driver.get(url)
-        wait = WebDriverWait(driver, 20)
+        wait = WebDriverWait(driver, 15)
         
-        # --- 1. SUI Balance (Display Only) ---
+        # --- 1. Get Balance (Robust Line Check) ---
         st.write("Fetching Balance...")
         time.sleep(5) 
         
         try:
             body_text = driver.find_element(By.TAG_NAME, "body").text.split('\n')
             balance_val = "Not Found"
-            
-            # Simple line scanner
             for index, line in enumerate(body_text):
+                # Search for "Balance" and grab the very next line if it looks like a number
                 if "Balance" in line and "SUI" in line:
                     if index + 1 < len(body_text):
-                        next_line = body_text[index + 1]
-                        if any(char.isdigit() for char in next_line):
-                            balance_val = next_line
-                            break
-            # Fallback scanner
-            if balance_val == "Not Found":
-                 for index, line in enumerate(body_text):
-                    if line.strip() == "Balance":
-                        if index + 1 < len(body_text):
-                            balance_val = body_text[index+1]
+                        possible_bal = body_text[index + 1]
+                        if any(char.isdigit() for char in possible_bal):
+                            balance_val = possible_bal
                             break
             st.metric("SUI Balance", balance_val)
         except:
-            st.warning("Could not read balance, proceeding to transactions...")
+            st.warning("Could not read balance, proceeding...")
 
         # --- 2. Switch to Activity ---
         try:
@@ -74,50 +66,45 @@ if start_btn:
             driver.execute_script("arguments[0].click();", act_tab)
             time.sleep(3)
         except:
-            st.write("Activity tab might already be active.")
+            st.write("Activity tab already active.")
 
-        # --- 3. Scrape Table ---
+        # --- 3. Scrape Loop ---
         progress = st.progress(0)
         
         for i in range(max_pages):
             st.write(f"📄 Scraping Page {i+1}...")
             
-            # Scroll down to make sure 'Next' button loads
+            # Scroll to bottom to ensure 'Next' arrow is in view
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(2)
 
-            # Find all Rows (we look for the rows that contain the Tx Link)
-            # This 'row' element allows us to grab the text for that entire line
-            rows_elements = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]/ancestor::div[contains(@class, 'row') or contains(@class, 'tr') or ./parent::td/parent::tr]")
+            # Find all rows by looking for the Hash Link (Blue Link)
+            rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
             
-            # Fallback: if complex row xpath fails, just find the links and assume standard row
-            if not rows_elements:
-                 rows_elements = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]/../../..")
-
-            if not rows_elements:
+            if not rows:
                 st.warning("No transactions found on this page.")
                 break
             
             page_count = 0
-            for row in rows_elements:
+            for row_link in rows:
                 try:
-                    row_text = row.text
-                    
-                    # 1. Get Hash/Link (Find the 'a' tag inside this row)
-                    link_el = row.find_element(By.XPATH, ".//a[contains(@href, '/tx/')]")
-                    tx_hash = link_el.text
-                    tx_url = link_el.get_attribute("href")
+                    # 1. Get Hash & Link
+                    tx_hash = row_link.text
+                    tx_url = row_link.get_attribute("href")
 
-                    # 2. Get Time using REGEX (Fail-safe)
-                    # Looks for pattern: "YYYY-MM-DD HH:MM:SS"
-                    # Example: 2026-01-11 23:13:12
-                    time_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})", row_text)
+                    # 2. Get Timestamp (STRICT REGEX)
+                    # We go up to the row container and get all text, then search for a date.
+                    # This prevents grabbing the hash end-string like '33uXL...'
+                    row_container = row_link.find_element(By.XPATH, "./ancestor::tr | ./ancestor::div[contains(@class, 'row')]")
+                    row_text = row_container.text
                     
-                    if time_match:
-                        timestamp = time_match.group(1)
+                    # Regex for 'YYYY-MM-DD HH:MM:SS'
+                    date_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})", row_text)
+                    
+                    if date_match:
+                        timestamp = date_match.group(1)
                     else:
-                        # Fallback: Just take the last piece of text in the row
-                        timestamp = row_text.split('\n')[-1]
+                        timestamp = "N/A" # Leave blank if no real date found
 
                     if tx_hash:
                         all_data.append({
@@ -129,35 +116,41 @@ if start_btn:
                 except:
                     continue
             
-            st.success(f"Collected {page_count} items from Page {i+1}")
+            st.success(f"Collected {page_count} transactions from Page {i+1}")
 
-            # --- Pagination (Next Button Fix) ---
+            # --- Pagination (Next Arrow Fix) ---
             if i < max_pages - 1:
                 try:
-                    # Look specifically for the Right Arrow icon (SVG)
-                    # This finds the SVG, then goes up to the clickable parent (button or div)
-                    next_btn = driver.find_element(By.XPATH, "//*[name()='svg' and contains(@class, 'lucide-chevron-right') or contains(@class, 'fa-chevron-right') or @data-icon='chevron-right'] | //button[contains(., 'Next')] | //button[./*[name()='svg']][last()]")
+                    # Strategy 1: Find the SVG arrow specifically (Right Chevron)
+                    # We look for an SVG inside a button/div that is NOT disabled
+                    next_arrow = driver.find_elements(By.XPATH, "//*[name()='svg' and (contains(@data-icon, 'right') or contains(@class, 'chevron-right'))]")
                     
-                    # If the button is disabled, we stop
-                    if "disabled" in next_btn.get_attribute("class") or next_btn.get_attribute("disabled"):
-                        st.write("Reached last page.")
-                        break
+                    clicked = False
+                    if next_arrow:
+                        # usually the last arrow is 'Next'
+                        target = next_arrow[-1]
+                        # Click the parent button, not the SVG itself
+                        parent_btn = target.find_element(By.XPATH, "./ancestor::button | ./ancestor::div[@role='button']")
+                        
+                        if parent_btn.is_enabled():
+                            driver.execute_script("arguments[0].click();", parent_btn)
+                            clicked = True
+                    
+                    # Strategy 2: Fallback to 'Last Button' in pagination container
+                    if not clicked:
+                        pagination_btns = driver.find_elements(By.XPATH, "//button[contains(@class, 'pagination')]")
+                        if pagination_btns:
+                             driver.execute_script("arguments[0].click();", pagination_btns[-1])
+                             clicked = True
 
-                    driver.execute_script("arguments[0].click();", next_btn)
-                    time.sleep(4) # Wait for reload
-                except:
-                    # Retry: Try clicking the "Next" arrow by just finding the last arrow on screen
-                    try:
-                        arrows = driver.find_elements(By.CSS_SELECTOR, "button svg, div[role='button'] svg")
-                        if arrows:
-                            driver.execute_script("arguments[0].parentElement.click();", arrows[-1])
-                            time.sleep(4)
-                        else:
-                            st.write("No next button found.")
-                            break
-                    except:
-                        st.write("Pagination failed.")
+                    if clicked:
+                        time.sleep(4) # Wait for table reload
+                    else:
+                        st.warning("Next button not found or disabled.")
                         break
+                except Exception as e:
+                    st.write(f"Pagination error: {e}")
+                    break
             
             progress.progress((i + 1) / max_pages)
 
