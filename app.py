@@ -10,7 +10,7 @@ from selenium.webdriver.support import expected_conditions as EC
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="SUI Scraper Final", layout="wide")
-st.title("🔹 SUI Wallet Scraper (Brute Force Mode)")
+st.title("🔹 SUI Wallet Scraper (Smart Logic)")
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -26,6 +26,7 @@ def get_driver():
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--disable-gpu')
+    # Force standard Desktop size to keep columns visible
     options.add_argument('--window-size=1920,1080')
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
     return webdriver.Chrome(options=options)
@@ -46,9 +47,11 @@ if start_btn:
         time.sleep(5) 
         try:
             body_text = driver.find_element(By.TAG_NAME, "body").text
+            # Look for 91.77... pattern directly if label fails
             match = re.search(r"Balance\s*\n\s*([0-9,]+\.[0-9]+)", body_text)
             balance_found = match.group(1) if match else "Not Found"
             if balance_found == "Not Found":
+                 # Fallback regex for the specific number format in your screenshot
                 match_strict = re.search(r"(\d{2,}\.\d{5,})", body_text)
                 if match_strict: balance_found = match_strict.group(1)
             st.metric("SUI Balance", balance_found)
@@ -65,56 +68,54 @@ if start_btn:
 
         # --- 3. SCRAPE LOOP ---
         progress = st.progress(0)
-        last_page_first_hash = "" # To check if page changed
-
+        
         for page_num in range(max_pages):
             st.write(f"📄 Scraping Page {page_num + 1}...")
             
-            # Scroll to bottom
+            # Scroll to ensure elements are interactable
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(2)
 
-            # Wait for rows
+            # Get current first item to verify pagination later
+            try:
+                first_row_check = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")[0].text
+            except:
+                first_row_check = "none"
+
+            # Find Rows
             rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
             if not rows:
                 st.warning("No transactions found.")
                 break
             
-            # --- STALE DATA CHECK ---
-            # If we clicked 'Next' but the first hash is SAME as last page, wait longer
-            retries = 0
-            while retries < 5:
-                current_first_hash = rows[0].text
-                if current_first_hash == last_page_first_hash:
-                    time.sleep(2) # Wait for table refresh
-                    rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
-                    retries += 1
-                else:
-                    break
-            
-            last_page_first_hash = rows[0].text # Update for next loop
-
-            # --- DATA EXTRACTION ---
             page_data = []
             for row_link in rows:
                 try:
                     tx_hash = row_link.text
                     tx_url = row_link.get_attribute("href")
                     
-                    # Grab full text of the row container
+                    # --- SMART TIMESTAMP FINDER ---
+                    # 1. Get the parent row container
                     row_container = row_link.find_element(By.XPATH, "./ancestor::tr | ./ancestor::div[contains(@class, 'row')]")
-                    row_text = row_container.text
                     
-                    # Timestamp Logic: Date OR Age
-                    # Priority 1: "2026-01-11 23:13:12"
-                    ts_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})", row_text)
-                    if ts_match:
-                        timestamp = ts_match.group(1)
+                    # 2. Find specifically the text that looks like time
+                    # We look for text matching "202X-" OR "ago" OR "m" / "h" / "d" standing alone
+                    # This avoids grabbing the Hash suffix
+                    full_row_text = row_container.text
+                    
+                    # Regex for Date (2026-01-11)
+                    date_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})", full_row_text)
+                    
+                    # Regex for Age (19h 55m, 2d, etc.) - STRICTER to avoid hash collisions
+                    # Looks for a number followed by d/h/m/s, ensuring it's not part of a long string
+                    age_match = re.search(r"\b(\d+[dhms]\s*\d*[dhms]*)\b", full_row_text)
+                    
+                    if date_match:
+                        timestamp = date_match.group(1)
+                    elif age_match:
+                        timestamp = age_match.group(1)
                     else:
-                        # Priority 2: "Age" format (e.g. 19h 55m, 2d)
-                        # Look for digits followed by d/h/m at the END of the string
-                        age_match = re.search(r"(\d+[dhms]\s*\d*[dhms]*)", row_text.split('\n')[-1])
-                        timestamp = age_match.group(1) if age_match else row_text.split('\n')[-1]
+                        timestamp = "N/A"
 
                     if tx_hash:
                         page_data.append({
@@ -128,38 +129,37 @@ if start_btn:
             all_data.extend(page_data)
             st.success(f"Collected {len(page_data)} items from Page {page_num + 1}")
 
-            # --- PAGINATION (The "Brute Force" Click) ---
+            # --- PAGINATION (Multi-Try Strategy) ---
             if page_num < max_pages - 1:
+                clicked = False
                 try:
-                    # Find ANY button with a 'chevron-right' icon inside it
-                    # This searches the whole DOM for the specific SVG path or class
-                    next_btns = driver.find_elements(By.XPATH, "//button[descendant::*[contains(@class, 'chevron-right') or contains(@class, 'lucide-chevron-right') or contains(@data-icon, 'right')]]")
+                    # Strategy: Find EVERY button that has a 'chevron-right' icon
+                    # We iterate and click them until the page data changes
+                    candidates = driver.find_elements(By.XPATH, "//button[descendant::*[contains(@class, 'chevron-right') or contains(@class, 'lucide-chevron-right') or contains(@data-icon, 'right')]]")
                     
-                    clicked = False
-                    if next_btns:
-                        # The 'Next' button is invariably the LAST one in the list
-                        target_btn = next_btns[-1]
-                        
-                        # Force scroll directly to it
-                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target_btn)
-                        time.sleep(1)
-                        
-                        if target_btn.is_enabled():
-                            # JavaScript Click (Bypasses 'element not interactable')
-                            driver.execute_script("arguments[0].click();", target_btn)
-                            clicked = True
-                            time.sleep(5) # Mandatory wait for new data load
+                    # Also add generic pagination buttons to candidates
+                    candidates += driver.find_elements(By.XPATH, "//div[contains(@class, 'pagination')]//button")
+                    
+                    # Filter for unique, enabled buttons
+                    valid_buttons = [btn for btn in candidates if btn.is_enabled()]
+                    
+                    # Reverse list (Next button is usually last)
+                    for btn in reversed(valid_buttons):
+                        try:
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                            driver.execute_script("arguments[0].click();", btn)
+                            time.sleep(3) # Wait for load
+                            
+                            # Check if page changed
+                            new_rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
+                            if new_rows and new_rows[0].text != first_row_check:
+                                clicked = True
+                                break # Success!
+                        except:
+                            continue # Try next button
                     
                     if not clicked:
-                        # Fallback: Find the pagination container and click the last button child
-                        footer_btns = driver.find_elements(By.XPATH, "//div[contains(@class, 'pagination')]//button")
-                        if footer_btns:
-                             driver.execute_script("arguments[0].click();", footer_btns[-1])
-                             clicked = True
-                             time.sleep(5)
-
-                    if not clicked:
-                        st.warning("Could not find or click Next button.")
+                        st.warning("Could not find working Next button.")
                         break
                         
                 except Exception as e:
