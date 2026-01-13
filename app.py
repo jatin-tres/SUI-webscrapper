@@ -9,8 +9,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="SUI Scraper V9", layout="wide")
-st.title("🔹 SUI Wallet Scraper (Final Logic)")
+st.set_page_config(page_title="SUI Scraper V10", layout="wide")
+st.title("🔹 SUI Wallet Scraper (Tab Switch Fix)")
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -26,6 +26,8 @@ def get_driver():
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--disable-gpu')
+    # Force 4K to ensure 'Time' column is rendered
+    options.add_argument('--window-size=3840,2160')
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
     return webdriver.Chrome(options=options)
 
@@ -36,7 +38,7 @@ if start_btn:
     
     try:
         driver = get_driver()
-        # CRITICAL: Force 4K resolution AFTER driver start to ensure columns render
+        # Force 4K resolution
         driver.set_window_size(3840, 2160)
         
         url = f"https://suiscan.xyz/mainnet/account/{wallet_address}"
@@ -50,22 +52,53 @@ if start_btn:
             body_text = driver.find_element(By.TAG_NAME, "body").text
             match = re.search(r"Balance\s*\n\s*([0-9,]+\.[0-9]+)", body_text)
             balance_found = match.group(1) if match else "Not Found"
-            
             if balance_found == "Not Found":
                 match_strict = re.search(r"(\d{2,3}(?:,\d{3})*\.\d{4,})", body_text)
                 if match_strict: balance_found = match_strict.group(1)
-                
             st.metric("SUI Balance", balance_found)
         except:
-            st.warning("Balance not found (Layout might have shifted).")
+            st.warning("Balance not found.")
 
-        # --- 2. NAVIGATE TO ACTIVITY ---
-        try:
-            act_tab = wait.until(EC.element_to_be_clickable((By.XPATH, "//div[contains(text(), 'Activity')]")))
-            driver.execute_script("arguments[0].click();", act_tab)
-            time.sleep(5)
-        except:
-            st.write("Activity tab might already be active.")
+        # --- 2. FORCE NAVIGATE TO ACTIVITY ---
+        st.write("Switching to Activity Tab...")
+        tab_switched = False
+        
+        # Try multiple selectors to click the tab
+        selectors = [
+            "//div[text()='Activity']", 
+            "//span[text()='Activity']",
+            "//button[contains(., 'Activity')]",
+            "//div[contains(@class, 'tab') and contains(., 'Activity')]"
+        ]
+        
+        for _ in range(3): # Retry loop
+            for xpath in selectors:
+                try:
+                    tabs = driver.find_elements(By.XPATH, xpath)
+                    for tab in tabs:
+                        # Only click visible tabs
+                        if tab.is_displayed():
+                            driver.execute_script("arguments[0].click();", tab)
+                            time.sleep(2)
+                            
+                            # VERIFY: Check if "Gas Fee" or "Type" header appears (Unique to Activity)
+                            body_check = driver.find_element(By.TAG_NAME, "body").text
+                            if "Gas Fee" in body_check or "Digest" in body_check:
+                                tab_switched = True
+                                break
+                    if tab_switched: break
+                except:
+                    continue
+            if tab_switched: break
+            time.sleep(1)
+            
+        if not tab_switched:
+            st.error("Could not switch to Activity Tab. Stuck on Portfolio.")
+            # Stop here to prevent empty CSV
+            driver.quit()
+            st.stop()
+        else:
+            st.success("Successfully switched to Activity Tab!")
 
         # --- 3. SCRAPE LOOP ---
         progress = st.progress(0)
@@ -90,37 +123,30 @@ if start_btn:
                     tx_hash = row_link.text
                     tx_url = row_link.get_attribute("href")
                     
-                    # --- TIMESTAMP LOGIC (Strict Filtering) ---
-                    # 1. Get row text
+                    # --- TIMESTAMP LOGIC ---
                     row_container = row_link.find_element(By.XPATH, "./ancestor::tr | ./ancestor::div[contains(@class, 'row')]")
                     row_text = row_container.text
                     
                     timestamp = "N/A"
                     
-                    # Check for "Age" pattern (e.g., 19h 55m, 2d)
-                    # We regex for digits followed by time units
+                    # Regex for Date (2026-...)
+                    date_match = re.search(r"(\d{4}-\d{2}-\d{2})", row_text)
+                    # Regex for Age (19h, 2d, 5m)
                     age_match = re.search(r"\b(\d+[dhms])\b", row_text)
                     
-                    # Check for Date pattern
-                    date_match = re.search(r"(\d{4}-\d{2}-\d{2})", row_text)
-                    
                     if date_match:
-                         # Try to grab full date string
                          full_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})", row_text)
                          timestamp = full_match.group(1) if full_match else date_match.group(1)
                     elif age_match:
-                        # Grab the age string (e.g. 19h 55m)
-                        # We split the row text and find the part that matches the age regex
+                        # Safe extract of age
                         parts = row_text.split()
                         for p in parts:
-                            if re.search(r"\d+[dhms]", p):
+                            if re.search(r"^\d+[dhms]$", p):
                                 timestamp = p
                                 break
                     
-                    # --- CRITICAL SANITY CHECK ---
-                    # If "timestamp" looks like the hash suffix (random chars), kill it.
-                    # Hashes usually have no specific time units and are long.
-                    if len(timestamp) > 10 and not any(x in timestamp for x in ['-', ':', ' ']):
+                    # Sanity Check
+                    if len(timestamp) > 12 and not any(x in timestamp for x in ['-', ':', ' ']):
                          timestamp = "N/A"
                     
                     if tx_hash:
@@ -135,20 +161,15 @@ if start_btn:
             all_data.extend(page_data)
             st.success(f"Collected {len(page_data)} items from Page {page_num + 1}")
 
-            # --- PAGINATION (Last Button Strategy) ---
+            # --- PAGINATION ---
             if page_num < max_pages - 1:
                 try:
-                    # Find all buttons
                     all_buttons = driver.find_elements(By.TAG_NAME, "button")
-                    # Filter for visible, enabled buttons
                     valid_buttons = [b for b in all_buttons if b.is_enabled() and b.is_displayed()]
                     
                     clicked = False
                     if valid_buttons:
-                        # The "Next" button is almost always the LAST valid button on the page
                         target = valid_buttons[-1]
-                        
-                        # Verify Y-coordinate (Pagination is at bottom, >500px usually)
                         if target.location['y'] > 200:
                             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target)
                             time.sleep(1)
@@ -157,7 +178,6 @@ if start_btn:
                             time.sleep(5)
                     
                     if not clicked:
-                        # Fallback: specific pagination class
                         footer_btns = driver.find_elements(By.XPATH, "//div[contains(@class, 'pagination')]//button")
                         if footer_btns:
                              driver.execute_script("arguments[0].click();", footer_btns[-1])
