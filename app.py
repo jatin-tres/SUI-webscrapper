@@ -9,8 +9,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="SUI Scraper V6", layout="wide")
-st.title("🔹 SUI Wallet Scraper (Position Fix)")
+st.set_page_config(page_title="SUI Scraper Final", layout="wide")
+st.title("🔹 SUI Wallet Scraper (Brute Force Mode)")
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -26,8 +26,7 @@ def get_driver():
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--disable-gpu')
-    # Force 4K to ensure 'Time' column is rendered
-    options.add_argument('--window-size=3840,2160')
+    options.add_argument('--window-size=1920,1080')
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
     return webdriver.Chrome(options=options)
 
@@ -45,23 +44,16 @@ if start_btn:
         # --- 1. FETCH BALANCE ---
         st.write("Fetching Balance...")
         time.sleep(5) 
-        
-        balance_found = "Not Found"
         try:
-            # Fuzzy Text Search (Works 100% if text exists)
-            page_text = driver.find_element(By.TAG_NAME, "body").text
-            # Look for "Balance" followed by a number
-            match = re.search(r"Balance\s*\n\s*([0-9,]+\.[0-9]+)", page_text)
-            if match:
-                balance_found = match.group(1)
-            else:
-                # Fallback: Look for the big number pattern directly
-                match_num = re.search(r"(\d{2,}\.\d{8,})", page_text)
-                if match_num:
-                    balance_found = match_num.group(1)
+            body_text = driver.find_element(By.TAG_NAME, "body").text
+            match = re.search(r"Balance\s*\n\s*([0-9,]+\.[0-9]+)", body_text)
+            balance_found = match.group(1) if match else "Not Found"
+            if balance_found == "Not Found":
+                match_strict = re.search(r"(\d{2,}\.\d{5,})", body_text)
+                if match_strict: balance_found = match_strict.group(1)
             st.metric("SUI Balance", balance_found)
         except:
-            st.warning("Balance could not be read.")
+            st.warning("Balance not found.")
 
         # --- 2. NAVIGATE TO ACTIVITY ---
         try:
@@ -69,56 +61,65 @@ if start_btn:
             driver.execute_script("arguments[0].click();", act_tab)
             time.sleep(3)
         except:
-            st.write("Activity tab might already be active.")
+            st.write("Activity tab already active.")
 
         # --- 3. SCRAPE LOOP ---
         progress = st.progress(0)
-        
+        last_page_first_hash = "" # To check if page changed
+
         for page_num in range(max_pages):
             st.write(f"📄 Scraping Page {page_num + 1}...")
             
-            # Scroll to absolute bottom to force pagination load
+            # Scroll to bottom
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(2)
 
-            # Find Rows
+            # Wait for rows
             rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
-            
             if not rows:
                 st.warning("No transactions found.")
                 break
-                
+            
+            # --- STALE DATA CHECK ---
+            # If we clicked 'Next' but the first hash is SAME as last page, wait longer
+            retries = 0
+            while retries < 5:
+                current_first_hash = rows[0].text
+                if current_first_hash == last_page_first_hash:
+                    time.sleep(2) # Wait for table refresh
+                    rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
+                    retries += 1
+                else:
+                    break
+            
+            last_page_first_hash = rows[0].text # Update for next loop
+
+            # --- DATA EXTRACTION ---
             page_data = []
             for row_link in rows:
                 try:
                     tx_hash = row_link.text
                     tx_url = row_link.get_attribute("href")
                     
-                    # --- TIMESTAMP FIX (Age Detection) ---
-                    # We grab the full row text
+                    # Grab full text of the row container
                     row_container = row_link.find_element(By.XPATH, "./ancestor::tr | ./ancestor::div[contains(@class, 'row')]")
                     row_text = row_container.text
                     
-                    # 1. Search for strict Date (2026-01-11)
-                    date_match = re.search(r"(\d{4}-\d{2}-\d{2})", row_text)
-                    if date_match:
-                        # Grab the full date time if possible
-                        full_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})", row_text)
-                        timestamp = full_match.group(1) if full_match else date_match.group(1)
+                    # Timestamp Logic: Date OR Age
+                    # Priority 1: "2026-01-11 23:13:12"
+                    ts_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})", row_text)
+                    if ts_match:
+                        timestamp = ts_match.group(1)
                     else:
-                        # 2. Search for "Age" pattern (e.g., 19h 55m, 2d, 5m ago)
-                        # Looks for digits followed by 'd', 'h', 'm' or 's'
-                        age_match = re.search(r"(\d+[dhms]\s*\d*[dhms]*)", row_text.split('\n')[-1]) # Check last part of text
-                        if age_match:
-                            timestamp = age_match.group(1)
-                        else:
-                            # 3. Final Fallback: Just take the last piece of text
-                            timestamp = row_text.split('\n')[-1]
+                        # Priority 2: "Age" format (e.g. 19h 55m, 2d)
+                        # Look for digits followed by d/h/m at the END of the string
+                        age_match = re.search(r"(\d+[dhms]\s*\d*[dhms]*)", row_text.split('\n')[-1])
+                        timestamp = age_match.group(1) if age_match else row_text.split('\n')[-1]
 
                     if tx_hash:
                         page_data.append({
                             "Transaction Hash": tx_hash,
-                            "Time/Age": timestamp,
+                            "Timestamp": timestamp,
                             "Link": tx_url
                         })
                 except:
@@ -127,42 +128,42 @@ if start_btn:
             all_data.extend(page_data)
             st.success(f"Collected {len(page_data)} items from Page {page_num + 1}")
 
-            # --- PAGINATION FIX (Last Button Strategy) ---
+            # --- PAGINATION (The "Brute Force" Click) ---
             if page_num < max_pages - 1:
                 try:
-                    # Instead of finding the arrow, we find the PAGINATION CONTAINER
-                    # and click the LAST button inside it.
-                    
-                    # 1. Find the pagination footer
-                    pagination_container = driver.find_elements(By.XPATH, "//div[contains(@class, 'pagination') or contains(@class, 'footer')]")
+                    # Find ANY button with a 'chevron-right' icon inside it
+                    # This searches the whole DOM for the specific SVG path or class
+                    next_btns = driver.find_elements(By.XPATH, "//button[descendant::*[contains(@class, 'chevron-right') or contains(@class, 'lucide-chevron-right') or contains(@data-icon, 'right')]]")
                     
                     clicked = False
-                    if pagination_container:
-                        # Find all buttons inside the footer
-                        buttons = pagination_container[-1].find_elements(By.TAG_NAME, "button")
-                        if buttons:
-                            next_btn = buttons[-1] # The last button is ALWAYS Next
-                            if next_btn.is_enabled():
-                                driver.execute_script("arguments[0].scrollIntoView(true);", next_btn)
-                                time.sleep(1)
-                                driver.execute_script("arguments[0].click();", next_btn)
-                                clicked = True
-                                time.sleep(4)
-                    
-                    # 2. Fallback: Find ALL buttons on page and click the last one with an SVG
-                    if not clicked:
-                        all_svg_btns = driver.find_elements(By.XPATH, "//button[descendant::*[name()='svg']]")
-                        if all_svg_btns:
-                            driver.execute_script("arguments[0].click();", all_svg_btns[-1])
+                    if next_btns:
+                        # The 'Next' button is invariably the LAST one in the list
+                        target_btn = next_btns[-1]
+                        
+                        # Force scroll directly to it
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target_btn)
+                        time.sleep(1)
+                        
+                        if target_btn.is_enabled():
+                            # JavaScript Click (Bypasses 'element not interactable')
+                            driver.execute_script("arguments[0].click();", target_btn)
                             clicked = True
-                            time.sleep(4)
+                            time.sleep(5) # Mandatory wait for new data load
+                    
+                    if not clicked:
+                        # Fallback: Find the pagination container and click the last button child
+                        footer_btns = driver.find_elements(By.XPATH, "//div[contains(@class, 'pagination')]//button")
+                        if footer_btns:
+                             driver.execute_script("arguments[0].click();", footer_btns[-1])
+                             clicked = True
+                             time.sleep(5)
 
                     if not clicked:
-                        st.warning("Could not find Next button.")
+                        st.warning("Could not find or click Next button.")
                         break
                         
                 except Exception as e:
-                    st.write(f"Pagination stopped: {e}")
+                    st.error(f"Pagination failed: {e}")
                     break
             
             progress.progress((page_num + 1) / max_pages)
