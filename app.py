@@ -9,8 +9,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="SUI Scraper V10", layout="wide")
-st.title("🔹 SUI Wallet Scraper (Tab Switch Fix)")
+st.set_page_config(page_title="SUI Scraper V11", layout="wide")
+st.title("🔹 SUI Wallet Scraper (Timing Fix)")
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -26,7 +26,7 @@ def get_driver():
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--disable-gpu')
-    # Force 4K to ensure 'Time' column is rendered
+    # Force 4K Resolution to ensure 'Time' column is visible
     options.add_argument('--window-size=3840,2160')
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
     return webdriver.Chrome(options=options)
@@ -38,12 +38,12 @@ if start_btn:
     
     try:
         driver = get_driver()
-        # Force 4K resolution
+        # Force window size again to be safe
         driver.set_window_size(3840, 2160)
         
         url = f"https://suiscan.xyz/mainnet/account/{wallet_address}"
         driver.get(url)
-        wait = WebDriverWait(driver, 20)
+        wait = WebDriverWait(driver, 25) # Increased wait time
         
         # --- 1. FETCH BALANCE ---
         st.write("Fetching Balance...")
@@ -59,48 +59,48 @@ if start_btn:
         except:
             st.warning("Balance not found.")
 
-        # --- 2. FORCE NAVIGATE TO ACTIVITY ---
+        # --- 2. SWITCH TO ACTIVITY ---
         st.write("Switching to Activity Tab...")
         tab_switched = False
         
-        # Try multiple selectors to click the tab
+        # Robust Click Logic
         selectors = [
-            "//div[text()='Activity']", 
-            "//span[text()='Activity']",
-            "//button[contains(., 'Activity')]",
-            "//div[contains(@class, 'tab') and contains(., 'Activity')]"
+            "//div[contains(text(), 'Activity')]", 
+            "//span[contains(text(), 'Activity')]",
+            "//button[contains(., 'Activity')]"
         ]
         
-        for _ in range(3): # Retry loop
-            for xpath in selectors:
-                try:
-                    tabs = driver.find_elements(By.XPATH, xpath)
-                    for tab in tabs:
-                        # Only click visible tabs
-                        if tab.is_displayed():
-                            driver.execute_script("arguments[0].click();", tab)
-                            time.sleep(2)
-                            
-                            # VERIFY: Check if "Gas Fee" or "Type" header appears (Unique to Activity)
-                            body_check = driver.find_element(By.TAG_NAME, "body").text
-                            if "Gas Fee" in body_check or "Digest" in body_check:
-                                tab_switched = True
-                                break
-                    if tab_switched: break
-                except:
-                    continue
-            if tab_switched: break
-            time.sleep(1)
-            
-        if not tab_switched:
-            st.error("Could not switch to Activity Tab. Stuck on Portfolio.")
-            # Stop here to prevent empty CSV
+        for xpath in selectors:
+            try:
+                tabs = driver.find_elements(By.XPATH, xpath)
+                for tab in tabs:
+                    if tab.is_displayed():
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", tab)
+                        time.sleep(1)
+                        driver.execute_script("arguments[0].click();", tab)
+                        time.sleep(2)
+                        tab_switched = True
+                        break
+                if tab_switched: break
+            except:
+                continue
+        
+        if tab_switched:
+            st.success("Tab clicked. Waiting for data to load...")
+        else:
+            st.error("Could not click Activity tab.")
             driver.quit()
             st.stop()
-        else:
-            st.success("Successfully switched to Activity Tab!")
 
-        # --- 3. SCRAPE LOOP ---
+        # --- 3. CRITICAL: WAIT FOR DATA ---
+        try:
+            # This is the FIX. We wait until at least one transaction link appears.
+            wait.until(EC.presence_of_element_located((By.XPATH, "//a[contains(@href, '/tx/')]")))
+            time.sleep(2) # Extra buffer for the rest of the table
+        except:
+            st.error("Timed out waiting for transactions to load. The table might be empty.")
+
+        # --- 4. SCRAPE LOOP ---
         progress = st.progress(0)
         
         for page_num in range(max_pages):
@@ -113,7 +113,7 @@ if start_btn:
             # Find Rows
             rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
             if not rows:
-                st.warning("No transactions found.")
+                st.warning("No transactions found on this page.")
                 break
             
             page_data = []
@@ -129,24 +129,25 @@ if start_btn:
                     
                     timestamp = "N/A"
                     
-                    # Regex for Date (2026-...)
+                    # 1. Check for Date (YYYY-MM-DD)
                     date_match = re.search(r"(\d{4}-\d{2}-\d{2})", row_text)
-                    # Regex for Age (19h, 2d, 5m)
+                    # 2. Check for Age (19h, 2d, 5m)
                     age_match = re.search(r"\b(\d+[dhms])\b", row_text)
                     
                     if date_match:
+                         # Try for full time
                          full_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})", row_text)
                          timestamp = full_match.group(1) if full_match else date_match.group(1)
                     elif age_match:
-                        # Safe extract of age
+                        # Extract the age part safely
                         parts = row_text.split()
                         for p in parts:
                             if re.search(r"^\d+[dhms]$", p):
                                 timestamp = p
                                 break
                     
-                    # Sanity Check
-                    if len(timestamp) > 12 and not any(x in timestamp for x in ['-', ':', ' ']):
+                    # CLEANUP: If timestamp looks like a hash, kill it
+                    if len(timestamp) > 15 and not any(x in timestamp for x in ['-', ':', ' ']):
                          timestamp = "N/A"
                     
                     if tx_hash:
@@ -164,18 +165,20 @@ if start_btn:
             # --- PAGINATION ---
             if page_num < max_pages - 1:
                 try:
+                    # Click Last Button Strategy
                     all_buttons = driver.find_elements(By.TAG_NAME, "button")
                     valid_buttons = [b for b in all_buttons if b.is_enabled() and b.is_displayed()]
                     
                     clicked = False
                     if valid_buttons:
                         target = valid_buttons[-1]
+                        # Ensure it's in the footer area (>200px down)
                         if target.location['y'] > 200:
                             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target)
                             time.sleep(1)
                             driver.execute_script("arguments[0].click();", target)
                             clicked = True
-                            time.sleep(5)
+                            time.sleep(5) # Wait for new page load
                     
                     if not clicked:
                         footer_btns = driver.find_elements(By.XPATH, "//div[contains(@class, 'pagination')]//button")
