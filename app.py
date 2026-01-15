@@ -9,8 +9,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="SUI Scraper V16", layout="wide")
-st.title("🔹 SUI Wallet Scraper (State-Locked Pagination)")
+st.set_page_config(page_title="SUI Scraper V17", layout="wide")
+st.title("🔹 SUI Wallet Scraper (Final Fix)")
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -78,7 +78,7 @@ if start_btn:
                 attempts += 1
         
         if not tab_verified:
-            st.error("Failed to switch tabs. Please restart.")
+            st.error("Failed to switch tabs.")
             driver.quit()
             st.stop()
 
@@ -93,42 +93,23 @@ if start_btn:
 
         # --- 4. SCRAPE LOOP ---
         progress = st.progress(0)
-        current_page_hash = ""  # Stores the first hash of the current page
+        last_first_hash = ""
         
         for page_num in range(max_pages):
             st.write(f"📄 Scraping Page {page_num + 1}...")
             
-            # Ensure we have new data before scraping
-            # If this is NOT the first page, we wait until the top hash CHANGES
-            if page_num > 0:
-                retries = 0
-                data_refreshed = False
-                while retries < 10: # Wait up to 10 seconds
-                    rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
-                    if rows:
-                        new_top_hash = rows[0].text
-                        if new_top_hash != current_page_hash:
-                            data_refreshed = True
-                            break # Data has changed!
-                    time.sleep(1)
-                    retries += 1
-                
-                if not data_refreshed:
-                    st.warning(f"Page {page_num + 1} did not load new data (Timed out). Stopping.")
-                    break
-
-            # Scroll to bottom to ensure full render
+            # Scroll to bottom to reveal pagination
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(2)
 
-            # --- EXTRACT DATA ---
+            # Get Rows
             rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
             if not rows:
                 st.warning("No transactions found.")
                 break
             
-            # Update current hash state
-            current_page_hash = rows[0].text
+            # Save state to check pagination success later
+            current_first_hash = rows[0].text
             
             page_data = []
             for row_link in rows:
@@ -140,16 +121,19 @@ if start_btn:
                     row_text = row_container.text
                     timestamp = "N/A"
                     
-                    # Robust Timestamp Regex
+                    # 1. Date Regex (2026-...)
                     date_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})", row_text)
-                    age_match = re.search(r"(\d+\s*[dhmsy]\s*(?:ago)?)", row_text)
+                    # 2. Age Regex (19h, 2d, 5m ago) - STRICT to avoid hashes
+                    # Matches "digits" followed by "d/h/m" followed by space or end of line
+                    age_match = re.search(r"(\d+[dhms])(?=\s|$)", row_text)
                     
                     if date_match:
                          timestamp = date_match.group(1)
                     elif age_match:
                         timestamp = age_match.group(1)
                     
-                    if len(timestamp) > 20 and " " not in timestamp:
+                    # Filter out Garbage (Long strings without spaces are hashes, not times)
+                    if len(timestamp) > 10 and " " not in timestamp and "-" not in timestamp:
                          timestamp = "N/A"
                     
                     if tx_hash:
@@ -164,36 +148,45 @@ if start_btn:
             all_data.extend(page_data)
             st.success(f"Collected {len(page_data)} items from Page {page_num + 1}")
 
-            # --- CLICK NEXT ---
+            # --- PAGINATION (The Fix) ---
             if page_num < max_pages - 1:
+                page_changed = False
+                
+                # Find all buttons that contain an SVG (Arrow icon)
+                # The "Next" button is usually the LAST button with an SVG
                 try:
-                    # Strategy: Click the LAST visible button in the DOM
-                    all_buttons = driver.find_elements(By.TAG_NAME, "button")
-                    visible_buttons = [b for b in all_buttons if b.is_displayed()]
+                    all_svg_buttons = driver.find_elements(By.XPATH, "//button[descendant::*[local-name()='svg']]")
                     
-                    clicked = False
-                    if visible_buttons:
-                        target = visible_buttons[-1]
-                        # Verify it's in the footer area
-                        if target.location['y'] > 200:
-                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target)
-                            time.sleep(0.5)
-                            driver.execute_script("arguments[0].click();", target)
-                            clicked = True
-                    
-                    if not clicked:
-                        # Fallback: Look for SVG arrows
-                        svg_btns = driver.find_elements(By.XPATH, "//button[descendant::*[local-name()='svg']]")
-                        if svg_btns:
-                            driver.execute_script("arguments[0].click();", svg_btns[-1])
-                            clicked = True
-                    
-                    if not clicked:
-                        st.warning("Next button not found.")
-                        break
+                    if all_svg_buttons:
+                        # Try the last one first (Next)
+                        next_btn = all_svg_buttons[-1]
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
+                        time.sleep(1)
+                        driver.execute_script("arguments[0].click();", next_btn)
                         
+                        # Wait for page load
+                        time.sleep(5)
+                        
+                        # Verify change
+                        new_rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
+                        if new_rows and new_rows[0].text != current_first_hash:
+                            page_changed = True
+                    
+                    if not page_changed:
+                        # Fallback: Try generic 'Next' text button just in case
+                        text_btns = driver.find_elements(By.XPATH, "//button[contains(., '>')]")
+                        if text_btns:
+                             driver.execute_script("arguments[0].click();", text_btns[-1])
+                             time.sleep(5)
+                             new_rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
+                             if new_rows and new_rows[0].text != current_first_hash:
+                                page_changed = True
+
                 except Exception as e:
-                    st.error(f"Pagination click failed: {e}")
+                    st.error(f"Pagination error: {e}")
+                
+                if not page_changed:
+                    st.warning("Could not go to next page (End of list or button blocked).")
                     break
             
             progress.progress((page_num + 1) / max_pages)
