@@ -9,8 +9,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="SUI Scraper V17", layout="wide")
-st.title("🔹 SUI Wallet Scraper (Final Fix)")
+st.set_page_config(page_title="SUI Scraper V18", layout="wide")
+st.title("🔹 SUI Wallet Scraper (State-Lock Fix)")
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -63,11 +63,14 @@ if start_btn:
         attempts = 0
         while not tab_verified and attempts < 3:
             try:
+                # Force click Activity tab
                 potential_tabs = driver.find_elements(By.XPATH, "//div[contains(text(), 'Activity')] | //button[contains(text(), 'Activity')]")
                 for tab in potential_tabs:
                     if tab.is_displayed():
                         driver.execute_script("arguments[0].click();", tab)
                         time.sleep(2)
+                
+                # Check if "Gas Fee" (unique to Activity table) is present
                 if "Gas Fee" in driver.page_source or "Digest" in driver.page_source:
                     tab_verified = True
                     st.success("Verified: Activity View Loaded.")
@@ -93,12 +96,32 @@ if start_btn:
 
         # --- 4. SCRAPE LOOP ---
         progress = st.progress(0)
-        last_first_hash = ""
+        
+        # We hold the first hash of the current page to ensure we moved
+        previous_page_first_hash = None
         
         for page_num in range(max_pages):
             st.write(f"📄 Scraping Page {page_num + 1}...")
             
-            # Scroll to bottom to reveal pagination
+            # --- STATE LOCK: WAIT FOR NEW DATA ---
+            if page_num > 0:
+                retries = 0
+                page_refreshed = False
+                while retries < 15: # Wait up to 15 seconds for page change
+                    current_rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
+                    if current_rows:
+                        current_top = current_rows[0].text
+                        if current_top != previous_page_first_hash:
+                            page_refreshed = True
+                            break
+                    time.sleep(1)
+                    retries += 1
+                
+                if not page_refreshed:
+                    st.warning(f"Page {page_num + 1} did not load unique data. Stopping to prevent duplicates.")
+                    break
+
+            # Scroll to bottom to ensure everything renders
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(2)
 
@@ -108,8 +131,8 @@ if start_btn:
                 st.warning("No transactions found.")
                 break
             
-            # Save state to check pagination success later
-            current_first_hash = rows[0].text
+            # Save the top hash for the next loop's check
+            previous_page_first_hash = rows[0].text
             
             page_data = []
             for row_link in rows:
@@ -121,19 +144,18 @@ if start_btn:
                     row_text = row_container.text
                     timestamp = "N/A"
                     
-                    # 1. Date Regex (2026-...)
+                    # 1. Date Regex
                     date_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})", row_text)
-                    # 2. Age Regex (19h, 2d, 5m ago) - STRICT to avoid hashes
-                    # Matches "digits" followed by "d/h/m" followed by space or end of line
-                    age_match = re.search(r"(\d+[dhms])(?=\s|$)", row_text)
+                    # 2. Age Regex (19h, 2d, 5m ago)
+                    age_match = re.search(r"(\d+\s*[dhmsy]\s*(?:ago)?)", row_text)
                     
                     if date_match:
                          timestamp = date_match.group(1)
                     elif age_match:
                         timestamp = age_match.group(1)
                     
-                    # Filter out Garbage (Long strings without spaces are hashes, not times)
-                    if len(timestamp) > 10 and " " not in timestamp and "-" not in timestamp:
+                    # Garbage filter
+                    if len(timestamp) > 20 and " " not in timestamp:
                          timestamp = "N/A"
                     
                     if tx_hash:
@@ -148,45 +170,39 @@ if start_btn:
             all_data.extend(page_data)
             st.success(f"Collected {len(page_data)} items from Page {page_num + 1}")
 
-            # --- PAGINATION (The Fix) ---
+            # --- CLICK NEXT ---
             if page_num < max_pages - 1:
-                page_changed = False
-                
-                # Find all buttons that contain an SVG (Arrow icon)
-                # The "Next" button is usually the LAST button with an SVG
                 try:
-                    all_svg_buttons = driver.find_elements(By.XPATH, "//button[descendant::*[local-name()='svg']]")
+                    # Find all buttons with an SVG (Arrow)
+                    # The 'Next' button is almost always the LAST one in the DOM
+                    svg_buttons = driver.find_elements(By.XPATH, "//button[descendant::*[local-name()='svg']]")
                     
-                    if all_svg_buttons:
-                        # Try the last one first (Next)
-                        next_btn = all_svg_buttons[-1]
-                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
+                    # Filter for visible buttons below the header (Y > 150)
+                    valid_buttons = [b for b in svg_buttons if b.is_displayed() and b.location['y'] > 150]
+                    
+                    clicked = False
+                    if valid_buttons:
+                        # Try the last one (most likely Next)
+                        target = valid_buttons[-1]
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target)
                         time.sleep(1)
-                        driver.execute_script("arguments[0].click();", next_btn)
-                        
-                        # Wait for page load
-                        time.sleep(5)
-                        
-                        # Verify change
-                        new_rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
-                        if new_rows and new_rows[0].text != current_first_hash:
-                            page_changed = True
+                        driver.execute_script("arguments[0].click();", target)
+                        clicked = True
                     
-                    if not page_changed:
-                        # Fallback: Try generic 'Next' text button just in case
-                        text_btns = driver.find_elements(By.XPATH, "//button[contains(., '>')]")
-                        if text_btns:
-                             driver.execute_script("arguments[0].click();", text_btns[-1])
-                             time.sleep(5)
-                             new_rows = driver.find_elements(By.XPATH, "//a[contains(@href, '/tx/')]")
-                             if new_rows and new_rows[0].text != current_first_hash:
-                                page_changed = True
-
+                    if not clicked:
+                        # Fallback: Text buttons like ">" or "Next"
+                        text_btns = driver.find_elements(By.XPATH, "//button[contains(., '>')] | //button[contains(., 'Next')]")
+                        visible_text_btns = [b for b in text_btns if b.is_displayed()]
+                        if visible_text_btns:
+                            driver.execute_script("arguments[0].click();", visible_text_btns[-1])
+                            clicked = True
+                    
+                    if not clicked:
+                        st.warning("Could not find Next button.")
+                        break
+                        
                 except Exception as e:
-                    st.error(f"Pagination error: {e}")
-                
-                if not page_changed:
-                    st.warning("Could not go to next page (End of list or button blocked).")
+                    st.error(f"Pagination click error: {e}")
                     break
             
             progress.progress((page_num + 1) / max_pages)
