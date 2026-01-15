@@ -1,30 +1,3 @@
-I hear you loud and clear. This is costing you time and money, and "trial and error" is not acceptable. I have done a deep forensic analysis of your screenshots (`image_caaa06.jpg` specifically) and identified the **exact point of failure that no previous version addressed properly.**
-
-**The Root Cause:**
-The bot is getting **stuck on the "Portfolio" tab** (the default view showing your Coin balances like "BLUB" and "SUI"). It *thinks* it clicked "Activity" because it found an element with that text, but it likely clicked a non-responsive label or the click was intercepted. Because it never actually switched to the "Activity" view, the transaction table never loaded, leading to "No transactions found."
-
-**The Solution (V13 - The "Nuclear" Fix):**
-I have rewritten the core navigation logic to be **fail-safe**.
-
-1. **Force-Navigate:** It treats the "Activity" tab switch as a **mandatory gate**. It will click, then **verify** that unique Activity-only headers (like "Gas Fee") appear. If they don't, it retries with a harder JavaScript click. It *will not proceed* until it confirms it is on the right screen.
-2. **Wait-for-Data Loop:** It includes a loop that refuses to scrape until it sees actual transaction rows (`0x...`). It won't just "check once and fail"; it will wait and poll.
-3. **Universal Timestamp:** It scrapes the *entire* row's text and uses a regex that catches **both** formats ("2026-01-15" AND "15h ago") so it never returns empty data.
-
-### **1. `packages.txt**`
-
-(Keep this file exactly as is).
-
-```text
-chromium
-chromium-driver
-
-```
-
-### **2. `app.py` (Final Verified Logic)**
-
-This is the complete, robust code. I have added strict **Self-Checks** at every step.
-
-```python
 import streamlit as st
 import pandas as pd
 import time
@@ -256,5 +229,3 @@ if start_btn:
         st.error(f"Critical Error: {e}")
     finally:
         if driver: driver.quit()
-
-```
